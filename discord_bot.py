@@ -3,15 +3,15 @@ Discord Bot for FXAP Decryption
 Decrypts FiveM client.lua files encrypted with fxap
 """
 
-import discord
-from discord.ext import commands
-import asyncio
 import os
-import tempfile
 import logging
 from datetime import datetime
+from functools import lru_cache
+from io import BytesIO
+
+import discord
+from discord.ext import commands
 from dotenv import load_dotenv
-from advanced_fxap_decryptor import FXAPDecryptor
 
 # Load environment variables
 load_dotenv()
@@ -39,8 +39,17 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Initialize decryptor
-decryptor = FXAPDecryptor(server_key=FIVEM_SERVER_KEY)
+
+@lru_cache(maxsize=1)
+def _get_decryptor(server_key):
+    from advanced_fxap_decryptor import FXAPDecryptor
+
+    return FXAPDecryptor(server_key=server_key)
+
+
+def get_decryptor():
+    """Lazily instantiate the decryptor to reduce startup overhead."""
+    return _get_decryptor(FIVEM_SERVER_KEY)
 
 @bot.event
 async def on_ready():
@@ -111,65 +120,54 @@ async def decrypt_file(ctx):
     processing_msg = await ctx.send(embed=processing_embed)
     
     try:
-        # Download file to temporary location
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.lua') as temp_file:
-            await attachment.save(temp_file.name)
-            temp_file_path = temp_file.name
-        
-        # Read file data
-        with open(temp_file_path, 'rb') as f:
-            file_data = f.read()
-        
+        file_data = await attachment.read()
+        if not file_data:
+            embed = discord.Embed(
+                title="❌ Empty File",
+                description="The attached file contained no data.",
+                color=discord.Color.red()
+            )
+            await processing_msg.edit(embed=embed)
+            return
+
+        decryptor = get_decryptor()
+
         logger.info(f"Processing file: {attachment.filename} ({len(file_data)} bytes)")
-        
-        # Check if file is encrypted
+
         if not decryptor.is_fxap_encrypted(file_data):
             embed = discord.Embed(
                 title="ℹ️ File Not Encrypted",
                 description="The uploaded file doesn't appear to be FXAP encrypted. It may already be decrypted.",
                 color=discord.Color.orange()
             )
-            
-            # Still send the file back in case user wants to see it
-            with open(temp_file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-            
-            if len(content) > 1900:  # Discord message limit consideration
-                # Save as file
+
+            content = file_data.decode('utf-8', errors='ignore')
+
+            if len(content) > 1900:
                 output_filename = f"not_encrypted_{attachment.filename}"
-                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.lua') as output_file:
-                    output_file.write(content)
-                    output_file_path = output_file.name
-                
+                buffer = BytesIO(file_data)
+                buffer.seek(0)
                 await processing_msg.edit(embed=embed)
-                await ctx.send(file=discord.File(output_file_path, filename=output_filename))
-                os.unlink(output_file_path)
+                await ctx.send(file=discord.File(buffer, filename=output_filename))
             else:
                 embed.add_field(name="File Content Preview", value=f"```lua\n{content[:1900]}\n```", inline=False)
                 await processing_msg.edit(embed=embed)
-            
-            os.unlink(temp_file_path)
             return
-        
-        # Attempt decryption using advanced methods
+
         success, decrypted_content, method_used, error_message = decryptor.decrypt_file_advanced(file_data)
-        
+
         if success:
-            # Create output file
             output_filename = f"decrypted_{attachment.filename}"
-            
-            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.lua', encoding='utf-8') as output_file:
-                output_file.write(decrypted_content)
-                output_file_path = output_file.name
-            
-            # Success embed
+            buffer = BytesIO(decrypted_content.encode('utf-8'))
+            buffer.seek(0)
+
             embed = discord.Embed(
                 title="✅ Decryption Successful",
                 description=f"Successfully decrypted `{attachment.filename}`",
                 color=discord.Color.green(),
                 timestamp=datetime.utcnow()
             )
-            
+
             embed.add_field(
                 name="📊 File Info",
                 value=f"**Original Size:** {attachment.size:,} bytes\n"
@@ -178,37 +176,32 @@ async def decrypt_file(ctx):
                       f"**Method:** {method_used}",
                 inline=True
             )
-            
-            # Add preview if content is short enough
+
             if len(decrypted_content) <= 1000:
                 embed.add_field(
                     name="📄 Preview",
                     value=f"```lua\n{decrypted_content[:1000]}\n```",
                     inline=False
                 )
-            
+
             embed.set_footer(text="⚠️ Use decrypted files responsibly and respect intellectual property rights")
-            
+
             await processing_msg.edit(embed=embed)
-            await ctx.send(file=discord.File(output_file_path, filename=output_filename))
-            
-            # Clean up
-            os.unlink(output_file_path)
-            
+            await ctx.send(file=discord.File(buffer, filename=output_filename))
+
         else:
-            # Failure embed
             embed = discord.Embed(
                 title="❌ Decryption Failed",
                 description=f"Could not decrypt `{attachment.filename}`",
                 color=discord.Color.red()
             )
-            
+
             embed.add_field(
                 name="Error Details",
                 value=error_message or "Unknown decryption error",
                 inline=False
             )
-            
+
             embed.add_field(
                 name="💡 Possible Solutions",
                 value="• Ensure the file is properly FXAP encrypted\n"
@@ -217,12 +210,9 @@ async def decrypt_file(ctx):
                       "• Contact the resource author for assistance",
                 inline=False
             )
-            
+
             await processing_msg.edit(embed=embed)
-        
-        # Clean up temp file
-        os.unlink(temp_file_path)
-        
+
     except Exception as e:
         logger.error(f"Error processing file {attachment.filename}: {e}")
         
@@ -234,13 +224,6 @@ async def decrypt_file(ctx):
         error_embed.add_field(name="Error", value=str(e), inline=False)
         
         await processing_msg.edit(embed=error_embed)
-        
-        # Clean up temp file if it exists
-        if 'temp_file_path' in locals():
-            try:
-                os.unlink(temp_file_path)
-            except:
-                pass
 
 @bot.command(name='help', help='Show help information')
 async def help_command(ctx):
@@ -345,25 +328,22 @@ async def analyze_file(ctx):
     attachment = ctx.message.attachments[0]
     
     try:
-        # Download file
-        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-            await attachment.save(temp_file.name)
-            temp_file_path = temp_file.name
-        
-        # Read file data
-        with open(temp_file_path, 'rb') as f:
-            file_data = f.read()
-        
-        # Analyze file
+        file_data = await attachment.read()
+        if not file_data:
+            await ctx.send("❌ Unable to analyze an empty file.")
+            return
+
+        decryptor = get_decryptor()
+
         encryption_type = decryptor.detect_encryption_type(file_data)
         resource_id = decryptor.extract_resource_id_advanced(file_data)
-        
+
         embed = discord.Embed(
             title="🔍 File Analysis",
             description=f"Analysis results for `{attachment.filename}`",
             color=discord.Color.blue()
         )
-        
+
         embed.add_field(
             name="📊 Basic Info",
             value=f"**Size:** {attachment.size:,} bytes\n"
@@ -371,30 +351,27 @@ async def analyze_file(ctx):
                   f"**Resource ID:** {resource_id or 'Not found'}",
             inline=False
         )
-        
-        # Check file header
+
         header = file_data[:32]
         embed.add_field(
             name="🔢 File Header (hex)",
             value=f"```{header.hex()[:64]}{'...' if len(header) > 32 else ''}```",
             inline=False
         )
-        
-        # Entropy analysis
-        entropy = len(set(file_data)) / 256.0
+
+        sample = file_data[:4096] if len(file_data) > 4096 else file_data
+        unique_bytes = len(set(sample))
+        entropy = unique_bytes / 256.0
         embed.add_field(
             name="📈 Entropy Analysis",
             value=f"**Byte Entropy:** {entropy:.3f}\n"
-                  f"**Unique Bytes:** {len(set(file_data))}/256\n"
+                  f"**Unique Bytes (sample):** {unique_bytes}/256\n"
                   f"**Likely Encrypted:** {'Yes' if entropy > 0.7 else 'No'}",
             inline=True
         )
-        
+
         await ctx.send(embed=embed)
-        
-        # Clean up
-        os.unlink(temp_file_path)
-        
+
     except Exception as e:
         logger.error(f"Error analyzing file: {e}")
         await ctx.send(f"❌ Error analyzing file: {str(e)}")
@@ -442,27 +419,29 @@ async def batch_decrypt(ctx):
     processing_msg = await ctx.send(embed=processing_embed)
     
     results = []
-    temp_files = []
-    
+    decryptor = get_decryptor()
+
     try:
         for i, attachment in enumerate(lua_files):
-            # Update progress
             progress_embed = discord.Embed(
                 title="🔄 Batch Processing",
                 description=f"Processing file {i+1}/{len(lua_files)}: `{attachment.filename}`",
                 color=discord.Color.blue()
             )
             await processing_msg.edit(embed=progress_embed)
-            
-            # Download and process file
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.lua') as temp_file:
-                await attachment.save(temp_file.name)
-                temp_files.append(temp_file.name)
-            
-            with open(temp_file.name, 'rb') as f:
-                file_data = f.read()
-            
-            # Decrypt
+
+            file_data = await attachment.read()
+            if not file_data:
+                results.append({
+                    'filename': attachment.filename,
+                    'success': False,
+                    'content': '',
+                    'method': '',
+                    'error': 'File was empty',
+                    'size': 0
+                })
+                continue
+
             success, content, method, error = decryptor.decrypt_file_advanced(file_data)
             results.append({
                 'filename': attachment.filename,
@@ -472,7 +451,7 @@ async def batch_decrypt(ctx):
                 'error': error,
                 'size': len(content) if success else 0
             })
-        
+
         # Create results summary
         successful = sum(1 for r in results if r['success'])
         failed = len(results) - successful
@@ -503,14 +482,12 @@ async def batch_decrypt(ctx):
         
         await processing_msg.edit(embed=summary_embed)
         
-        # Send successful decryptions
         for result in results:
             if result['success']:
                 output_filename = f"decrypted_{result['filename']}"
-                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.lua', encoding='utf-8') as output_file:
-                    output_file.write(result['content'])
-                    await ctx.send(file=discord.File(output_file.name, filename=output_filename))
-                    os.unlink(output_file.name)
+                buffer = BytesIO(result['content'].encode('utf-8'))
+                buffer.seek(0)
+                await ctx.send(file=discord.File(buffer, filename=output_filename))
         
     except Exception as e:
         logger.error(f"Batch processing error: {e}")
@@ -520,14 +497,6 @@ async def batch_decrypt(ctx):
             color=discord.Color.red()
         )
         await processing_msg.edit(embed=error_embed)
-    
-    finally:
-        # Clean up temp files
-        for temp_file in temp_files:
-            try:
-                os.unlink(temp_file)
-            except:
-                pass
 
 @bot.command(name='status', help='Show bot status and statistics')
 async def status_command(ctx):

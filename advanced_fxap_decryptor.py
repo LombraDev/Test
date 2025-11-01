@@ -5,17 +5,50 @@ Enhanced version with multiple decryption strategies and better format support
 
 import struct
 import hashlib
-import hmac
 import base64
 import zlib
 import logging
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.backends import default_backend
 import re
 
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+
 logger = logging.getLogger(__name__)
+
+_ZLIB_SIGNATURES = (b"\x78\x01", b"\x78\x9c", b"\x78\xda")
+_GZIP_SIGNATURE = b"\x1f\x8b"
+_MAX_RESOURCE_SCAN_BYTES = 200_000
+_MAX_LUA_VALIDATION_BYTES = 200_000
+_MAX_DECOMPRESSED_BYTES = 5_000_000
+_MAX_KEY_ATTEMPTS = 32
+_LUA_PATTERN_STRINGS = [
+    r"\bfunction\s+\w+",
+    r"\blocal\s+\w+",
+    r"\bend\b",
+    r"\bif\s+.+\bthen\b",
+    r"\bfor\s+\w+",
+    r"\bwhile\s+.+\bdo\b",
+    r"\breturn\b",
+    r"\brequire\s*\(",
+    r"CreateThread\s*\(",
+    r"Citizen\.",
+    r"ESX\.",
+    r"QBCore\.",
+    r"RegisterNetEvent",
+    r"AddEventHandler",
+    r"--.*",
+]
+_LUA_PATTERNS = [re.compile(pattern, re.IGNORECASE) for pattern in _LUA_PATTERN_STRINGS]
+_RESOURCE_PATTERN_STRINGS = [
+    r"resource_manifest_version\s+[\'"](.*?)[\'"]",
+    r"fx_version\s+[\'"](.*?)[\'"]",
+    r"name\s+[\'"](.*?)[\'"]",
+    r"@([a-zA-Z0-9_-]+)",
+    r"resource[_-]([a-zA-Z0-9_-]+)",
+]
+_RESOURCE_PATTERNS = [re.compile(pattern, re.IGNORECASE) for pattern in _RESOURCE_PATTERN_STRINGS]
+_PRINTABLE_WHITESPACE = {"\n", "\r", "\t"}
+_CHACHA_OFFSETS = (0, 12, 16, 20)
 
 class AdvancedFXAPDecryptor:
     def __init__(self, server_key=None):
@@ -43,6 +76,12 @@ class AdvancedFXAPDecryptor:
             b'cfx_encryption_key_v2',
             b'fxserver_protection_key',
         ]
+
+    def is_fxap_encrypted(self, file_data: bytes) -> bool:
+        """Return True if the payload appears to be FXAP protected."""
+        if not file_data:
+            return False
+        return any(file_data.startswith(signature) for signature in self.FXAP_SIGNATURES)
     
     def detect_encryption_type(self, file_data):
         """
@@ -54,13 +93,12 @@ class AdvancedFXAPDecryptor:
         Returns:
             str: Encryption type ('fxap', 'lua_bytecode', 'xor', 'unknown')
         """
-        if len(file_data) < 8:
+        if len(file_data) < 4:
             return 'unknown'
         
         # Check for FXAP signatures
-        for signature in self.FXAP_SIGNATURES:
-            if file_data.startswith(signature):
-                return 'fxap'
+        if self.is_fxap_encrypted(file_data):
+            return 'fxap'
         
         # Check for Lua bytecode
         if file_data.startswith(b'\x1b\x4c\x75\x61'):
@@ -124,44 +162,45 @@ class AdvancedFXAPDecryptor:
             key = hashlib.sha256(key).digest()
         
         nonces_to_try = []
-        
+
         if nonce:
-            nonces_to_try.append(nonce)
-        
-        # Try extracting nonce from data
+            nonces_to_try.append(nonce[:12])
+
         if len(data) >= 12:
-            nonces_to_try.append(data[:12])
-            nonces_to_try.append(data[-12:])
-        
-        # Try common nonces
+            nonces_to_try.extend([data[:12], data[-12:]])
+
         nonces_to_try.extend([
             b'\x00' * 12,
             b'\x01' * 12,
             hashlib.sha256(key).digest()[:12],
         ])
-        
-        for test_nonce in nonces_to_try:
+
+        unique_nonces = []
+        seen_nonces = set()
+        for candidate in nonces_to_try:
+            if not candidate or len(candidate) != 12:
+                continue
+            if candidate in seen_nonces:
+                continue
+            seen_nonces.add(candidate)
+            unique_nonces.append(candidate)
+
+        for test_nonce in unique_nonces:
             try:
-                cipher = Cipher(
-                    algorithms.ChaCha20(key, test_nonce),
-                    mode=None,
-                    backend=self.backend
-                )
-                decryptor = cipher.decryptor()
-                
-                # Try different data offsets
-                for offset in [0, 12, 16, 20]:
+                cipher = Cipher(algorithms.ChaCha20(key, test_nonce), mode=None, backend=self.backend)
+                for offset in _CHACHA_OFFSETS:
                     if len(data) <= offset:
                         continue
-                    
+
+                    decryptor = cipher.decryptor()
                     test_data = data[offset:]
                     try:
                         result = decryptor.update(test_data) + decryptor.finalize()
-                        if self.is_valid_lua_content(result):
-                            return result
-                    except:
+                    except Exception:
                         continue
-                        
+
+                    if self.is_valid_lua_content(result):
+                        return result
             except Exception as e:
                 logger.debug(f"ChaCha20 attempt failed: {e}")
                 continue
@@ -243,11 +282,18 @@ class AdvancedFXAPDecryptor:
         
         for key in keys:
             try:
+                if not key:
+                    continue
+
+                key_bytes = bytes(key)
+                key_len = len(key_bytes)
+                if key_len == 0:
+                    continue
+
                 result = bytearray()
-                key_len = len(key)
                 
                 for i, byte in enumerate(data):
-                    result.append(byte ^ key[i % key_len])
+                    result.append(byte ^ key_bytes[i % key_len])
                 
                 result_bytes = bytes(result)
                 if self.is_valid_lua_content(result_bytes):
@@ -296,21 +342,27 @@ class AdvancedFXAPDecryptor:
         Returns:
             bytes: Decompressed data or None
         """
-        # Try zlib
-        try:
-            decompressed = zlib.decompress(data)
-            return decompressed
-        except:
-            pass
-        
-        # Try gzip
-        try:
-            import gzip
-            decompressed = gzip.decompress(data)
-            return decompressed
-        except:
-            pass
-        
+        if len(data) < 2:
+            return None
+
+        if data[:2] in _ZLIB_SIGNATURES:
+            try:
+                decompressed = zlib.decompress(data, max_length=_MAX_DECOMPRESSED_BYTES)
+                return decompressed
+            except Exception:
+                pass
+
+        if data.startswith(_GZIP_SIGNATURE):
+            try:
+                import gzip
+
+                decompressed = gzip.decompress(data)
+                if len(decompressed) > _MAX_DECOMPRESSED_BYTES:
+                    return decompressed[:_MAX_DECOMPRESSED_BYTES]
+                return decompressed
+            except Exception:
+                pass
+
         return None
     
     def is_valid_lua_content(self, data):
@@ -323,41 +375,25 @@ class AdvancedFXAPDecryptor:
         Returns:
             bool: True if content appears to be valid Lua
         """
+        if len(data) > _MAX_LUA_VALIDATION_BYTES:
+            data = data[:_MAX_LUA_VALIDATION_BYTES]
+
         try:
             content = data.decode('utf-8', errors='ignore')
-        except:
+        except Exception:
             return False
-        
+
         if len(content.strip()) < 10:
             return False
-        
-        # Check for Lua patterns
-        lua_patterns = [
-            r'\bfunction\s+\w+',
-            r'\blocal\s+\w+',
-            r'\bend\b',
-            r'\bif\s+.+\bthen\b',
-            r'\bfor\s+\w+',
-            r'\bwhile\s+.+\bdo\b',
-            r'\breturn\b',
-            r'\brequire\s*\(',
-            r'CreateThread\s*\(',
-            r'Citizen\.',
-            r'ESX\.',
-            r'QBCore\.',
-            r'RegisterNetEvent',
-            r'AddEventHandler',
-            r'--.*',  # Lua comments
-        ]
-        
-        pattern_matches = sum(1 for pattern in lua_patterns if re.search(pattern, content, re.IGNORECASE))
-        
-        # Must have multiple Lua patterns and reasonable character distribution
-        if pattern_matches >= 3:
-            # Check character distribution
-            printable_ratio = sum(1 for c in content if c.isprintable()) / len(content)
+
+        sample_content = content if len(content) <= _MAX_LUA_VALIDATION_BYTES else content[:_MAX_LUA_VALIDATION_BYTES]
+        pattern_matches = sum(1 for pattern in _LUA_PATTERNS if pattern.search(sample_content))
+
+        if pattern_matches >= 3 and sample_content:
+            printable_chars = sum(1 for c in sample_content if c.isprintable() or c in _PRINTABLE_WHITESPACE)
+            printable_ratio = printable_chars / len(sample_content)
             return printable_ratio > 0.8
-        
+
         return False
     
     def decrypt_file_advanced(self, file_data):
@@ -429,9 +465,22 @@ class AdvancedFXAPDecryptor:
                     hashlib.sha256(file_data[-32:]).digest(),
                 ])
                 
-                # Try each decryption method with each key
-                for i, key in enumerate(keys_to_try):
-                    logger.debug(f"Trying key {i+1}/{len(keys_to_try)}")
+                normalized_keys = []
+                seen_keys = set()
+                for candidate in keys_to_try:
+                    if not candidate:
+                        continue
+                    normalized = candidate if len(candidate) == 32 else hashlib.sha256(candidate).digest()
+                    if normalized in seen_keys:
+                        continue
+                    seen_keys.add(normalized)
+                    normalized_keys.append(normalized)
+                    if len(normalized_keys) >= _MAX_KEY_ATTEMPTS:
+                        break
+                
+                total_keys = len(normalized_keys)
+                for i, key in enumerate(normalized_keys):
+                    logger.debug(f"Trying key {i+1}/{total_keys}")
                     
                     # Method 1: ChaCha20
                     result = self.try_chacha20_decrypt(file_data, key)
@@ -489,25 +538,20 @@ class AdvancedFXAPDecryptor:
                             return resource_id
             
             # Strategy 2: Search for embedded resource IDs
-            text_data = file_data.decode('utf-8', errors='ignore')
+            sample_bytes = file_data[:_MAX_RESOURCE_SCAN_BYTES]
+            text_data = sample_bytes.decode('utf-8', errors='ignore')
             
-            # Look for common FiveM resource ID patterns
-            patterns = [
-                r'resource_manifest_version\s+[\'"]([^\'"]+)[\'"]',
-                r'fx_version\s+[\'"]([^\'"]+)[\'"]',
-                r'name\s+[\'"]([^\'"]+)[\'"]',
-                r'@([a-zA-Z0-9_-]+)',
-                r'resource[_-]([a-zA-Z0-9_-]+)',
-            ]
-            
-            for pattern in patterns:
-                matches = re.findall(pattern, text_data, re.IGNORECASE)
-                if matches:
-                    return matches[0]
+            for pattern in _RESOURCE_PATTERNS:
+                match = pattern.search(text_data)
+                if not match:
+                    continue
+                candidate = match.group(1) if match.lastindex else match.group(0)
+                candidate = candidate.strip()
+                if candidate:
+                    return candidate
             
             # Strategy 3: Extract from filename-like strings
-            words = re.findall(r'[a-zA-Z0-9_-]{3,20}', text_data)
-            for word in words:
+            for word in re.findall(r'[a-zA-Z0-9_-]{3,20}', text_data)[:20]:
                 if len(word) >= 5 and not word.isdigit():
                     return word
             
